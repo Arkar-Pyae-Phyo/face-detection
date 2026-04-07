@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Academic Exam Verification Portal" />
+  <title>{% block title %}Exam Portal{% endblock %} | Academic Verification</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+  {% block head %}{% endblock %}
+</head>
+<body>
+
+  <!-- ========== Navigation Bar ========== -->
+  <nav class="navbar">
+    <a href="/" class="navbar-brand">
+      <span class="brand-icon">EV</span>
+      <span>Exam Verification Portal</span>
+    </a>
+    <ul class="navbar-links">
+      <li><a href="/register" class="{% if request.path == '/register' %}active{% endif %}">Register</a></li>
+      <li><a href="/login" class="{% if request.path == '/login' %}active{% endif %}">Login</a></li>
+      <li><a href="/admin" class="{% if request.path == '/admin' %}active{% endif %}">Admin</a></li>
+      {% if session.get('student_id') %}
+      <li><a href="/exam" class="{% if request.path == '/exam' %}active{% endif %}">Exam</a></li>
+      <li><a href="/logout">Logout</a></li>
+      {% endif %}
+    </ul>
+  </nav>
+
+  <!-- ========== Page Content ========== -->
+  <main class="main-container {% block container_class %}{% endblock %}">
+    {% block content %}{% endblock %}
+  </main>
+
+  <!-- ========== JavaScript ========== -->
+  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

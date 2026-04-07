@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Exam{% endblock %}
+
+{% block content %}
+<div class="glass-card" style="max-width:680px; margin:0 auto;">
+  <div class="exam-welcome">
+    <div class="welcome-icon">OK</div>
+    <h2>Exam Access Confirmed</h2>
+    <p class="student-info">
+      Logged in as <strong>{{ student_name }}</strong> &nbsp;·&nbsp; ID: <strong>{{ student_id }}</strong>
+    </p>
+
+    <div class="exam-card">
+      <h3>Exam Instructions</h3>
+      <ul>
+        <li>You have <strong>60 minutes</strong> to complete this exam.</li>
+        <li>Answer all questions to the best of your ability.</li>
+        <li>Do not switch tabs or leave this page during the exam.</li>
+        <li>Your session is secured and verified via face recognition.</li>
+        <li>Your responses are auto-saved every 30 seconds.</li>
+      </ul>
+    </div>
+
+    <div class="exam-card">
+      <h3>Exam Details</h3>
+      <ul>
+        <li>Subject: <strong>Introduction to Computer Science</strong></li>
+        <li>Date: <strong>{{ current_date if current_date else "March 30, 2026" }}</strong></li>
+        <li>Total Questions: <strong>50</strong></li>
+        <li>Passing Score: <strong>60%</strong></li>
+      </ul>
+    </div>
+
+    <div class="gap-row mt-4" style="justify-content:center;">
+      <button class="btn btn-success" onclick="alert('Exam module would start here. This is a demo page.')">
+        Start Exam
+      </button>
+      <a href="/logout" class="btn btn-outline">
+        Logout
+      </a>
+    </div>
+  </div>
+</div>
+{% endblock %}

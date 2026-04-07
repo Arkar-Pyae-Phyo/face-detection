@@ -1,0 +1,349 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+
+{% block content %}
+<!-- ========== Page Header ========== -->
+<div class="page-header">
+  <h1>Student Registration</h1>
+  <p>Register your profile image for identity verification before examination access.</p>
+</div>
+
+<div class="glass-card" style="max-width:640px; margin:0 auto;">
+
+  <!-- ========== Student Information Form ========== -->
+  <div class="form-group">
+    <label for="studentId">Student ID <span style="color:var(--danger)">*</span></label>
+    <input type="text" class="form-control" id="studentId"
+           placeholder="e.g. STU-2025-001" maxlength="20" autocomplete="off" />
+  </div>
+  <div class="form-group">
+    <label for="studentName">Full Name <span style="color:var(--danger)">*</span></label>
+    <input type="text" class="form-control" id="studentName"
+           placeholder="e.g. John Doe" maxlength="100" />
+  </div>
+  <div class="form-group">
+    <label for="studentEmail">Email <span style="color:var(--text-muted)">(optional)</span></label>
+    <input type="email" class="form-control" id="studentEmail"
+           placeholder="john@university.edu" maxlength="100" />
+  </div>
+
+  <!-- Divider between form and camera section -->
+  <div class="divider"></div>
+
+  <!-- ========== Webcam Section (hidden until camera started) ========== -->
+  <div id="cameraSection" style="display:none;">
+    <div class="webcam-area" id="webcamArea">
+      <!-- Live webcam preview (mirrored via CSS) -->
+      <video id="videoPreview" autoplay playsinline muted></video>
+      <!-- Hidden canvas used solely to capture frames -->
+      <canvas id="captureCanvas"></canvas>
+      <!-- Overlay: dashed oval face guide -->
+      <div class="webcam-overlay">
+        <div class="face-guide"></div>
+      </div>
+      <!-- Horizontal scan-line animation (activated during capture) -->
+      <div class="scan-line" id="scanLine"></div>
+    </div>
+
+    <!-- Capture progress dots (1 dot per sample) -->
+    <div class="capture-progress" id="captureProgress"></div>
+  </div>
+
+  <!-- ========== Status / Feedback Messages ========== -->
+  <div class="status-bar" id="statusBar"></div>
+
+  <!-- ========== Action Buttons ========== -->
+  <div class="gap-row mt-2">
+    <!-- Step 1: Start the webcam -->
+    <button class="btn btn-primary btn-block" id="btnStartCamera" onclick="startCamera()">
+      Start Camera
+    </button>
+
+    <!-- Step 2: Capture 5 face samples (hidden until camera is live) -->
+    <button class="btn btn-success btn-block" id="btnCaptureSamples"
+            onclick="captureFaceSamples()" style="display:none;">
+      Capture Face Samples
+    </button>
+  </div>
+
+  <!-- Step 3: Submit to backend (hidden until all samples captured) -->
+  <button class="btn btn-primary btn-block mt-3" id="btnSubmit"
+          onclick="submitRegistration()" style="display:none;">
+    Complete Registration
+  </button>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // ==================================================================
+  //  Registration Page – JavaScript Logic
+  // ==================================================================
+
+  // --------------- Configuration ---------------
+  const TOTAL_CAPTURES = 5;       // Number of face images to capture
+  const CAPTURE_DELAY_MS = 700;   // Delay between automatic captures (ms)
+
+  // --------------- State variables ---------------
+  let capturedImages = [];         // Array of base64-encoded JPEG strings
+  let cameraStream   = null;       // MediaStream reference for cleanup
+
+  // ==================================================================
+  //  Step 1: Validate form fields and start the webcam
+  // ==================================================================
+  async function startCamera() {
+    // --- Validate required fields before opening camera ---
+    const sid  = document.getElementById('studentId').value.trim();
+    const name = document.getElementById('studentName').value.trim();
+
+    if (!sid) {
+      return showStatus('Please enter your Student ID.', 'error');
+    }
+    if (!name) {
+      return showStatus('Please enter your full name.', 'error');
+    }
+
+    // --- Request camera access via getUserMedia ---
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' }
+      });
+
+      // Attach stream to the <video> element
+      document.getElementById('videoPreview').srcObject = cameraStream;
+
+      // Show the camera section
+      document.getElementById('cameraSection').style.display = 'block';
+
+      // Build progress-dot indicators (1 per capture)
+      const dotsHtml = Array.from({ length: TOTAL_CAPTURES }, (_, i) =>
+        `<div class="capture-dot" id="dot-${i}"></div>`
+      ).join('');
+      document.getElementById('captureProgress').innerHTML = dotsHtml;
+
+      // Swap buttons: hide "Start Camera", show "Capture Face Samples"
+      document.getElementById('btnStartCamera').style.display = 'none';
+      document.getElementById('btnCaptureSamples').style.display = 'flex';
+
+      // Lock the form fields so they can't be changed mid-capture
+      document.getElementById('studentId').readOnly = true;
+      document.getElementById('studentName').readOnly = true;
+      document.getElementById('studentEmail').readOnly = true;
+
+      showStatus(
+        'Camera ready! Position your face inside the oval guide, then click "Capture Face Samples".',
+        'info'
+      );
+
+    } catch (err) {
+      // Handle permission denied or missing camera
+      console.error('Camera error:', err);
+      showStatus(
+        'Could not access the camera. Please allow camera permissions and try again.',
+        'error'
+      );
+    }
+  }
+
+  // ==================================================================
+  //  Step 2: Automatically capture 5 face images with short delays
+  // ==================================================================
+  async function captureFaceSamples() {
+    const btn = document.getElementById('btnCaptureSamples');
+    btn.disabled = true;   // prevent double-clicks
+    capturedImages = [];   // reset any previous captures
+
+    showStatus('Checking posture. Look straight at the camera.', 'info');
+    const postureReady = await waitForCorrectPosture();
+    if (!postureReady) {
+      btn.disabled = false;
+      return;
+    }
+
+    // Reset all progress dots to uncaptured state
+    for (let i = 0; i < TOTAL_CAPTURES; i++) {
+      document.getElementById(`dot-${i}`).classList.remove('captured');
+    }
+
+    // Activate the scan-line animation overlay
+    document.getElementById('scanLine').classList.add('active');
+
+    showStatus('Scanning... Please look at the camera and stay still.', 'info');
+
+    // --- Capture loop: take one frame per iteration ---
+    for (let i = 0; i < TOTAL_CAPTURES; i++) {
+      // Short delay between captures so the user can shift gaze slightly
+      await sleep(CAPTURE_DELAY_MS);
+
+      // Grab the current frame as a base64 JPEG data URL
+      const frameData = captureCurrentFrame();
+
+      if (frameData) {
+        capturedImages.push(frameData);
+        // Light up the corresponding progress dot
+        document.getElementById(`dot-${i}`).classList.add('captured');
+      }
+
+      showStatus(`Captured ${i + 1} of ${TOTAL_CAPTURES}...`, 'info');
+    }
+
+    // Stop the scan animation
+    document.getElementById('scanLine').classList.remove('active');
+
+    // --- Evaluate capture results ---
+    if (capturedImages.length >= 3) {
+      // Enough good images → allow submission
+      showStatus(
+        `${capturedImages.length} face samples captured successfully. Click "Complete Registration" to submit.`,
+        'success'
+      );
+      document.getElementById('btnCaptureSamples').style.display = 'none';
+      document.getElementById('btnSubmit').style.display = 'flex';
+    } else {
+      // Not enough frames – let user retry
+      showStatus(
+        'Not enough clear frames captured. Please improve lighting and try again.',
+        'error'
+      );
+      btn.disabled = false;
+    }
+  }
+
+  // ==================================================================
+  //  captureCurrentFrame()
+  //  Draws the current video frame onto a hidden <canvas>
+  //  and returns it as a base64-encoded JPEG data URL.
+  // ==================================================================
+  function captureCurrentFrame() {
+    const video  = document.getElementById('videoPreview');
+    const canvas = document.getElementById('captureCanvas');
+
+    // Match canvas dimensions to the live video resolution
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    // Draw the video frame onto the canvas
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0);
+
+    // Export as JPEG with 90% quality → returns "data:image/jpeg;base64,..."
+    return canvas.toDataURL('image/jpeg', 0.9);
+  }
+
+  // ==================================================================
+  //  Step 3: Send captured images + student info to the backend
+  // ==================================================================
+  async function submitRegistration() {
+    const btn = document.getElementById('btnSubmit');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Processing faces...';
+
+    // Build the JSON payload
+    const payload = {
+      student_id:   document.getElementById('studentId').value.trim(),
+      student_name: document.getElementById('studentName').value.trim(),
+      email:        document.getElementById('studentEmail').value.trim(),
+      images:       capturedImages,   // array of base64 data URLs
+    };
+
+    try {
+      // POST to the Flask /api/register-face endpoint
+      const response = await fetch('/api/register-face', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        // --- Registration succeeded ---
+        showStatus(result.message, 'success');
+        btn.style.display = 'none';
+
+        // Stop the webcam stream to release the camera
+        stopCamera();
+
+        // Redirect to login page after a brief pause
+        setTimeout(() => {
+          window.location.href = '/login';
+        }, 2500);
+
+      } else {
+        // --- Backend returned an error (e.g. no face, duplicate ID) ---
+        showStatus(result.message, 'error');
+        btn.disabled = false;
+        btn.innerHTML = 'Complete Registration';
+      }
+
+    } catch (networkErr) {
+      // --- Network / fetch failure ---
+      console.error('Submit error:', networkErr);
+      showStatus('Network error. Please check your connection and try again.', 'error');
+      btn.disabled = false;
+      btn.innerHTML = 'Complete Registration';
+    }
+  }
+
+  // ==================================================================
+  //  stopCamera()
+  //  Stops all media tracks to release the webcam hardware.
+  // ==================================================================
+  function stopCamera() {
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      cameraStream = null;
+    }
+  }
+
+  async function postureCheck(imageBase64) {
+    try {
+      const response = await fetch('/api/posture-check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: imageBase64 }),
+      });
+      return await response.json();
+    } catch (err) {
+      return { success: false, message: 'Unable to check posture. Please keep your face steady.' };
+    }
+  }
+
+  async function waitForCorrectPosture() {
+    let stableFrames = 0;
+
+    while (cameraStream) {
+      const frame = captureCurrentFrame();
+      if (!frame) {
+        await sleep(250);
+        continue;
+      }
+
+      const result = await postureCheck(frame);
+      if (result.success) {
+        stableFrames += 1;
+        if (stableFrames >= 2) {
+          showStatus('Posture accepted.', 'success');
+          return true;
+        }
+      } else {
+        stableFrames = 0;
+        showStatus(result.message || 'Adjust your face position and try again.', 'warning');
+      }
+
+      await sleep(500);
+    }
+
+    showStatus('Camera is not active. Please start the camera again.', 'error');
+    return false;
+  }
+
+  // ==================================================================
+  //  sleep(ms)  –  Promise-based delay for async/await usage.
+  // ==================================================================
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+</script>
+{% endblock %}

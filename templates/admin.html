@@ -1,0 +1,471 @@
+{% extends "base.html" %}
+{% block title %}Admin Panel{% endblock %}
+{% block container_class %}wide{% endblock %}
+
+{% block content %}
+<!-- ========== Page Header ========== -->
+<div class="page-header">
+  <h1>Administration Dashboard</h1>
+  <p>Manage registered students and review face verification login logs.</p>
+</div>
+
+<!-- ========== Stats Overview Cards ========== -->
+<!-- These cards show at-a-glance counts. They update automatically
+     when data is fetched from the backend. -->
+<div class="stats-row" id="statsRow">
+  <div class="stat-card">
+    <div class="stat-value" id="statStudents">—</div>
+    <div class="stat-label">Registered Students</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" id="statLogins">—</div>
+    <div class="stat-label">Total Login Attempts</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" id="statSuccess">—</div>
+    <div class="stat-label">Successful Logins</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" id="statFailed">—</div>
+    <div class="stat-label">Failed Attempts</div>
+  </div>
+</div>
+
+<!-- ========== Tab Switcher ========== -->
+<!-- Two tabs: "Students" shows registered student list,
+     "Login Logs" shows every verification attempt. -->
+<div class="tab-switcher">
+  <button class="tab-btn active" id="tabBtnStudents" onclick="switchTab('students', this)">
+    Students
+  </button>
+  <button class="tab-btn" id="tabBtnLogs" onclick="switchTab('logs', this)">
+    Login Logs
+  </button>
+</div>
+
+<!-- ========== Students Tab ========== -->
+<div class="tab-content active" id="tab-students">
+  <div class="glass-card compact">
+
+    <!-- Search bar for filtering students -->
+    <div class="admin-search-row">
+      <input type="text" class="form-control" id="searchStudents"
+             placeholder="Search by ID or name" oninput="filterStudents()" />
+      <span class="admin-count" id="studentCount">0 students</span>
+    </div>
+
+    <!-- Students table container (populated by JS) -->
+    <div id="studentsTableContainer">
+      <div class="empty-state">
+        <div class="empty-icon">...</div>
+        <p>Loading students...</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== Login Logs Tab ========== -->
+<div class="tab-content" id="tab-logs">
+  <div class="glass-card compact">
+
+    <!-- Filter bar for logs -->
+    <div class="admin-search-row">
+      <input type="text" class="form-control" id="searchLogs"
+             placeholder="Search by student ID" oninput="filterLogs()" />
+      <!-- Result filter dropdown -->
+      <select class="form-control" id="filterResult"
+              onchange="filterLogs()" style="max-width:180px;">
+        <option value="all">All Results</option>
+        <option value="success">Success Only</option>
+        <option value="failed">Failed Only</option>
+      </select>
+      <span class="admin-count" id="logCount">0 logs</span>
+    </div>
+
+    <!-- Logs table container (populated by JS) -->
+    <div id="logsTableContainer">
+      <div class="empty-state">
+        <div class="empty-icon">...</div>
+        <p>Loading logs...</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== Image Preview Modal ========== -->
+<!-- Clicking any photo/snapshot opens it in a full-screen overlay.
+     Click anywhere or press Escape to close. -->
+<div class="image-modal-overlay" id="imageModal" onclick="closeModal()">
+  <img id="modalImage" src="" alt="Preview" />
+</div>
+
+<!-- ========== Delete Confirmation Modal ========== -->
+<!-- A nicer confirmation dialog than browser's confirm() -->
+<div class="image-modal-overlay" id="deleteModal">
+  <div class="delete-confirm-card">
+    <div class="delete-confirm-icon">!</div>
+    <h3>Delete Student?</h3>
+    <p id="deleteConfirmText">Are you sure you want to delete this student and all their data?</p>
+    <div class="gap-row" style="justify-content:center; margin-top:20px;">
+      <button class="btn btn-danger" id="btnConfirmDelete" onclick="confirmDelete()">
+        Yes, Delete
+      </button>
+      <button class="btn btn-outline" onclick="cancelDelete()">
+        Cancel
+      </button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // ==================================================================
+  //  Admin Dashboard – JavaScript Logic
+  //
+  //  This page uses the Fetch API to load data from the Flask backend:
+  //    GET  /api/students             → list of students + login logs
+  //    GET  /api/login-logs           → login logs only
+  //    DELETE /api/delete-student/ID  → remove a student
+  //
+  //  Data is rendered into HTML tables dynamically.
+  //  No page reload needed — everything updates via JS.
+  // ==================================================================
+
+  // ─── State ───
+  let allStudents = [];   // full list from backend (used for search filtering)
+  let allLogs     = [];   // full list from backend
+  let pendingDeleteId = null;  // student_id waiting for delete confirmation
+
+  // ==================================================================
+  //  Tab switching
+  // ==================================================================
+  function switchTab(tabName, btnEl) {
+    // Deactivate all tabs and buttons
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+
+    // Activate the selected tab
+    document.getElementById('tab-' + tabName).classList.add('active');
+    btnEl.classList.add('active');
+  }
+
+  // ==================================================================
+  //  Load all data from backend
+  //  GET /api/students returns both students[] and logs[]
+  // ==================================================================
+  async function loadAdminData() {
+    try {
+      // Fetch students and logs in one call
+      const res  = await fetch('/api/students');
+      const data = await res.json();
+
+      if (!data.success) {
+        console.error('API returned failure:', data.message);
+        return;
+      }
+
+      // Store in state for filtering
+      allStudents = data.students || [];
+      allLogs     = data.logs     || [];
+
+      // ── Update stat cards ──
+      document.getElementById('statStudents').textContent = allStudents.length;
+      document.getElementById('statLogins').textContent   = allLogs.length;
+      document.getElementById('statSuccess').textContent  =
+        allLogs.filter(l => l.verification_result === 'success').length;
+      document.getElementById('statFailed').textContent   =
+        allLogs.filter(l => l.verification_result === 'failed').length;
+
+      // ── Render tables ──
+      renderStudents(allStudents);
+      renderLogs(allLogs);
+
+    } catch (err) {
+      console.error('Failed to load admin data:', err);
+    }
+  }
+
+  // ==================================================================
+  //  Render the students table
+  //  Columns: Photo | Student ID | Name | Email | Registered | Actions
+  // ==================================================================
+  function renderStudents(students) {
+    const container = document.getElementById('studentsTableContainer');
+    document.getElementById('studentCount').textContent =
+      students.length + ' student' + (students.length !== 1 ? 's' : '');
+
+    // ── Empty state ──
+    if (students.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">No Data</div>
+          <p>No students registered yet.</p>
+        </div>`;
+      return;
+    }
+
+    // ── Build table HTML ──
+    let html = `
+      <table class="data-table" id="studentsTable">
+        <thead>
+          <tr>
+            <th>Photo</th>
+            <th>Student ID</th>
+            <th>Name</th>
+            <th>Email</th>
+            <th>Registered</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+    students.forEach(s => {
+      // Build image path — replace backslashes for URL compatibility
+      const photoSrc = s.photo_path
+        ? '/' + s.photo_path.replace(/\\/g, '/')
+        : '';
+
+      html += `
+        <tr id="row-${escapeHtml(s.student_id)}">
+          <td>
+            ${photoSrc
+              ? `<img class="student-photo" src="${photoSrc}" alt="Photo"
+                      onclick="openModal('${photoSrc}')"
+                      title="Click to enlarge" />`
+              : '<span style="color:var(--text-muted)">—</span>'}
+          </td>
+          <td><strong>${escapeHtml(s.student_id)}</strong></td>
+          <td>${escapeHtml(s.student_name)}</td>
+          <td>${s.email ? escapeHtml(s.email) : '<span style="color:var(--text-muted)">—</span>'}</td>
+          <td>${formatDate(s.created_at)}</td>
+          <td>
+            <button class="btn btn-danger btn-sm"
+                    onclick="requestDelete('${escapeAttr(s.student_id)}', '${escapeAttr(s.student_name)}')">
+              Delete
+            </button>
+          </td>
+        </tr>`;
+    });
+
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  }
+
+  // ==================================================================
+  //  Render the login logs table
+  //  Columns: # | Student ID | Login Time | Result | Snapshot
+  // ==================================================================
+  function renderLogs(logs) {
+    const container = document.getElementById('logsTableContainer');
+    document.getElementById('logCount').textContent =
+      logs.length + ' log' + (logs.length !== 1 ? 's' : '');
+
+    // ── Empty state ──
+    if (logs.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">No Data</div>
+          <p>No login attempts recorded yet.</p>
+        </div>`;
+      return;
+    }
+
+    // ── Build table HTML ──
+    let html = `
+      <table class="data-table" id="logsTable">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Student ID</th>
+            <th>Login Time</th>
+            <th>Result</th>
+            <th>Snapshot</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+    logs.forEach(l => {
+      const snapSrc = l.snapshot_path
+        ? '/' + l.snapshot_path.replace(/\\/g, '/')
+        : '';
+
+      // Color-coded badge for result
+      const badge = l.verification_result === 'success'
+        ? '<span class="badge badge-success">Success</span>'
+        : '<span class="badge badge-failed">Failed</span>';
+
+      html += `
+        <tr>
+          <td>${l.id}</td>
+          <td><strong>${escapeHtml(l.student_id)}</strong></td>
+          <td>${formatDate(l.login_time)}</td>
+          <td>${badge}</td>
+          <td>
+            ${snapSrc
+              ? `<img class="snapshot-photo" src="${snapSrc}" alt="Snap"
+                      onclick="openModal('${snapSrc}')"
+                      title="Click to enlarge" />`
+              : '<span style="color:var(--text-muted)">—</span>'}
+          </td>
+        </tr>`;
+    });
+
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  }
+
+  // ==================================================================
+  //  Search / filter functions
+  // ==================================================================
+
+  // Filter the students table by ID or name
+  function filterStudents() {
+    const query = document.getElementById('searchStudents').value.trim().toLowerCase();
+
+    if (!query) {
+      renderStudents(allStudents);
+      return;
+    }
+
+    const filtered = allStudents.filter(s =>
+      s.student_id.toLowerCase().includes(query) ||
+      s.student_name.toLowerCase().includes(query)
+    );
+    renderStudents(filtered);
+  }
+
+  // Filter the logs table by student ID and result type
+  function filterLogs() {
+    const query  = document.getElementById('searchLogs').value.trim().toLowerCase();
+    const result = document.getElementById('filterResult').value;
+
+    let filtered = allLogs;
+
+    // Filter by student ID text
+    if (query) {
+      filtered = filtered.filter(l =>
+        l.student_id.toLowerCase().includes(query)
+      );
+    }
+
+    // Filter by result type
+    if (result !== 'all') {
+      filtered = filtered.filter(l => l.verification_result === result);
+    }
+
+    renderLogs(filtered);
+  }
+
+  // ==================================================================
+  //  Delete student (with confirmation modal)
+  // ==================================================================
+
+  // Show the custom delete confirmation modal
+  function requestDelete(studentId, studentName) {
+    pendingDeleteId = studentId;
+    document.getElementById('deleteConfirmText').textContent =
+      `Delete "${studentName}" (${studentId}) and all their login logs?`;
+    document.getElementById('deleteModal').classList.add('open');
+  }
+
+  // User confirmed deletion → call the DELETE API
+  async function confirmDelete() {
+    if (!pendingDeleteId) return;
+
+    const btn = document.getElementById('btnConfirmDelete');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Deleting...';
+
+    try {
+      const res  = await fetch(`/api/delete-student/${pendingDeleteId}`, {
+        method: 'DELETE'
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        // Close modal and reload all data
+        cancelDelete();
+        loadAdminData();
+      } else {
+        alert('Error: ' + data.message);
+      }
+    } catch (err) {
+      alert('Network error. Could not delete student.');
+    }
+
+    btn.disabled = false;
+    btn.innerHTML = 'Yes, Delete';
+  }
+
+  // User cancelled deletion
+  function cancelDelete() {
+    pendingDeleteId = null;
+    document.getElementById('deleteModal').classList.remove('open');
+  }
+
+  // ==================================================================
+  //  Image preview modal
+  // ==================================================================
+  function openModal(src) {
+    document.getElementById('modalImage').src = src;
+    document.getElementById('imageModal').classList.add('open');
+  }
+
+  function closeModal() {
+    document.getElementById('imageModal').classList.remove('open');
+  }
+
+  // ==================================================================
+  //  Utility functions
+  // ==================================================================
+
+  // Escape HTML special characters to prevent XSS attacks
+  function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // Escape for use inside HTML attribute strings (e.g. onclick)
+  function escapeAttr(str) {
+    return str.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  }
+
+  // Format a date/time string for display
+  // Input:  "2026-03-30 23:45:12"  or null
+  // Output: "Mar 30, 2026 · 23:45" or "—"
+  function formatDate(dateStr) {
+    if (!dateStr) return '<span style="color:var(--text-muted)">—</span>';
+    try {
+      const d = new Date(dateStr);
+      const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                      'Jul','Aug','Sep','Oct','Nov','Dec'];
+      const month = months[d.getMonth()];
+      const day   = d.getDate();
+      const year  = d.getFullYear();
+      const hours = String(d.getHours()).padStart(2, '0');
+      const mins  = String(d.getMinutes()).padStart(2, '0');
+      return `${month} ${day}, ${year} · ${hours}:${mins}`;
+    } catch (e) {
+      return dateStr;  // fallback: return raw string
+    }
+  }
+
+  // ==================================================================
+  //  Keyboard shortcuts
+  // ==================================================================
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      closeModal();
+      cancelDelete();
+    }
+  });
+
+  // ==================================================================
+  //  Initialize: load data when page opens
+  // ==================================================================
+  loadAdminData();
+</script>
+{% endblock %}
