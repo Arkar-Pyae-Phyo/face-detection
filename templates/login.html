@@ -5,7 +5,7 @@
 <!-- ========== Page Header ========== -->
 <div class="page-header">
   <h1>Student Authentication</h1>
-  <p>Provide your student ID, complete the liveness challenge, and verify identity to access the exam session.</p>
+  <p>Provide your student ID and complete face verification to access the exam session.</p>
 </div>
 
 <div class="glass-card" style="max-width:580px; margin:0 auto;">
@@ -30,20 +30,6 @@
       <div class="scan-line" id="loginScanLine"></div>
     </div>
 
-    <!-- ========== Liveness Challenge Banner ========== -->
-    <!-- Shows the instruction (e.g. "Please blink once") with a countdown timer -->
-    <div class="liveness-banner" id="livenessBanner" style="display:none;">
-      <div class="liveness-icon" id="livenessIcon">L</div>
-      <div class="liveness-text">
-        <div class="liveness-label">Liveness Check</div>
-        <div class="liveness-instruction" id="livenessInstruction">—</div>
-      </div>
-      <div class="liveness-timer" id="livenessTimer">—</div>
-    </div>
-
-    <!-- ========== Liveness Result Badge ========== -->
-    <div class="liveness-result" id="livenessResult" style="display:none;"></div>
-
     <!-- ========== Confidence Meter (shown after face verification) ========== -->
     <div class="confidence-meter" id="confidenceMeter" style="display:none;">
       <div class="meter-label">Match Confidence</div>
@@ -65,13 +51,7 @@
       Start Camera
     </button>
 
-    <!-- STEP 2: Begin liveness challenge (hidden until camera is live) -->
-    <button class="btn btn-primary btn-block" id="btnLiveness"
-            onclick="startLivenessCheck()" style="flex:1; display:none;">
-      Start Liveness Check
-    </button>
-
-    <!-- STEP 3: Verify face (hidden until liveness passes) -->
+    <!-- STEP 2: Verify face (hidden until camera is live) -->
     <button class="btn btn-success btn-block" id="btnVerify"
             onclick="verifyFace()" style="flex:1; display:none;">
       Verify Face
@@ -91,42 +71,8 @@
 
 {% block scripts %}
 <script>
-  // ==================================================================
-  //  Login Page – JavaScript Logic
-  //
-  //  NEW 3-STEP FLOW (with liveness detection):
-  //
-  //    Step 1: Student enters ID → clicks "Start Camera"
-  //            → webcam opens
-  //
-  //    Step 2: Clicks "Start Liveness Check"
-  //            → frontend calls GET /api/liveness-challenge
-  //            → backend returns a random challenge ("blink",
-  //              "turn_left", or "turn_right")
-  //            → frontend shows instruction and captures ~15 frames
-  //              over 3 seconds
-  //            → frontend sends frames to POST /api/liveness-check
-  //            → backend analyzes with MediaPipe Face Mesh
-  //            → if passed → unlock "Verify Face" button
-  //
-  //    Step 3: Clicks "Verify Face"
-  //            → same as before: capture frame, POST /api/verify-face
-  //            → backend checks face encoding match + session creation
-  //            → redirect to /exam
-  // ==================================================================
+  let loginStream = null;
 
-  // --------------- Configuration ---------------
-  const LIVENESS_CAPTURE_COUNT    = 15;   // number of frames to capture
-  const LIVENESS_CAPTURE_INTERVAL = 200;  // ms between frames (3s total)
-  const LIVENESS_COUNTDOWN_SEC    = 3;    // countdown before capture starts
-
-  // --------------- State ---------------
-  let loginStream     = null;   // MediaStream reference
-  let livenessChallenge = null; // current challenge type from backend
-
-  // ==================================================================
-  //  Step 1: Validate student ID and start the webcam
-  // ==================================================================
   async function startLoginCamera() {
     const studentId = document.getElementById('loginStudentId').value.trim();
     if (!studentId) {
@@ -134,28 +80,17 @@
     }
 
     try {
-      // Request webcam access
       loginStream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: 'user' }
       });
 
-      // Attach stream to video element
       document.getElementById('loginVideo').srcObject = loginStream;
-
-      // Show camera section
       document.getElementById('loginCamSection').style.display = 'block';
-
-      // Lock the student ID field
       document.getElementById('loginStudentId').readOnly = true;
-
-      // Swap buttons: hide "Start Camera", show "Start Liveness Check"
       document.getElementById('btnStartCamera').style.display = 'none';
-      document.getElementById('btnLiveness').style.display = 'flex';
+      document.getElementById('btnVerify').style.display = 'flex';
 
-      showStatus(
-        'Camera is live. Click "Start Liveness Check" to verify you are a real person.',
-        'info'
-      );
+      showStatus('Camera is live. Face forward and click "Verify Face".', 'info');
 
     } catch (err) {
       console.error('Camera error:', err);
@@ -163,117 +98,6 @@
     }
   }
 
-  // ==================================================================
-  //  Step 2: Liveness check
-  //  2a. Fetch a random challenge from backend
-  //  2b. Show instruction + countdown
-  //  2c. Capture frames during the action window
-  //  2d. Send frames to backend for analysis
-  // ==================================================================
-  async function startLivenessCheck() {
-    const btn = document.getElementById('btnLiveness');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Preparing...';
-
-    showStatus('Checking posture. Please look straight at the camera.', 'info');
-    const postureReady = await waitForCorrectPosture();
-    if (!postureReady) {
-      btn.disabled = false;
-      btn.innerHTML = 'Start Liveness Check';
-      return;
-    }
-
-    // Reset any previous liveness result
-    document.getElementById('livenessResult').style.display = 'none';
-
-    // ---- 2a. Fetch a random challenge ----
-    try {
-      const res = await fetch('/api/liveness-challenge');
-      const data = await res.json();
-
-      if (!data.success) {
-        showStatus('Failed to get liveness challenge. Try again.', 'error');
-        btn.disabled = false;
-        btn.innerHTML = 'Start Liveness Check';
-        return;
-      }
-
-      livenessChallenge = data.challenge;
-      const instruction = data.instruction;
-
-      // ---- 2b. Show the challenge banner with icon ----
-      const icons = { blink: 'B', turn_left: 'L', turn_right: 'R' };
-      document.getElementById('livenessIcon').textContent = icons[livenessChallenge] || 'L';
-      document.getElementById('livenessInstruction').textContent = instruction;
-      document.getElementById('livenessBanner').style.display = 'flex';
-
-      // ---- Countdown before capture starts ----
-      const timerEl = document.getElementById('livenessTimer');
-      for (let i = LIVENESS_COUNTDOWN_SEC; i > 0; i--) {
-        timerEl.textContent = i;
-        showStatus(`Get ready... ${instruction}. Starting in ${i}s`, 'warning');
-        await sleep(1000);
-      }
-      timerEl.textContent = 'Now';
-      showStatus(`Now! ${instruction}`, 'info');
-
-      // ---- 2c. Capture frames ----
-      // Activate scan line for visual feedback
-      document.getElementById('loginScanLine').classList.add('active');
-
-      const frames = [];
-      for (let i = 0; i < LIVENESS_CAPTURE_COUNT; i++) {
-        frames.push(captureFrame());
-        await sleep(LIVENESS_CAPTURE_INTERVAL);
-      }
-
-      document.getElementById('loginScanLine').classList.remove('active');
-      showStatus('Analyzing liveness...', 'info');
-
-      // ---- 2d. Send frames to backend for analysis ----
-      const checkRes = await fetch('/api/liveness-check', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ frames: frames }),
-      });
-      const checkData = await checkRes.json();
-
-      // ---- Show result ----
-      const resultEl = document.getElementById('livenessResult');
-      resultEl.style.display = 'block';
-
-      if (checkData.success) {
-        // Liveness passed -> show success and unlock "Verify Face"
-        resultEl.className = 'liveness-result liveness-passed';
-        resultEl.innerHTML = 'Liveness check passed.';
-        document.getElementById('livenessBanner').style.display = 'none';
-        showStatus('Liveness verified! Now click "Verify Face" to complete login.', 'success');
-
-        // Hide liveness button, show verify button
-        document.getElementById('btnLiveness').style.display = 'none';
-        document.getElementById('btnVerify').style.display = 'flex';
-
-      } else {
-        // Liveness failed -> let user retry
-        resultEl.className = 'liveness-result liveness-failed';
-        resultEl.innerHTML = checkData.message;
-        showStatus(checkData.message, 'error');
-
-        btn.disabled = false;
-        btn.innerHTML = 'Retry Liveness Check';
-      }
-
-    } catch (err) {
-      console.error('Liveness error:', err);
-      showStatus('Network error during liveness check.', 'error');
-      btn.disabled = false;
-      btn.innerHTML = 'Start Liveness Check';
-    }
-  }
-
-  // ==================================================================
-  //  Step 3: Face verification (same as before, but only after liveness)
-  // ==================================================================
   async function verifyFace() {
     const btn = document.getElementById('btnVerify');
     btn.disabled = true;
@@ -342,9 +166,6 @@
     }
   }
 
-  // ==================================================================
-  //  captureFrame() – Grab the current video frame as base64 JPEG
-  // ==================================================================
   function captureFrame() {
     const video  = document.getElementById('loginVideo');
     const canvas = document.getElementById('loginCanvas');
@@ -354,9 +175,6 @@
     return canvas.toDataURL('image/jpeg', 0.85);
   }
 
-  // ==================================================================
-  //  stopLoginCamera() – Release webcam hardware
-  // ==================================================================
   function stopLoginCamera() {
     if (loginStream) {
       loginStream.getTracks().forEach(track => track.stop());
@@ -406,9 +224,6 @@
     return false;
   }
 
-  // ==================================================================
-  //  sleep(ms) – Promise-based delay
-  // ==================================================================
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }

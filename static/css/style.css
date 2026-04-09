@@ -536,6 +536,52 @@ body {
   font-size: 0.86rem;
 }
 
+.admin-subtext {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.admin-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.suspicious-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.suspicious-card h3 {
+  color: var(--primary);
+  margin: 0;
+}
+
+.suspicious-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.action-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -624,6 +670,37 @@ body {
   max-height: 84vh;
   border-radius: var(--radius-sm);
   border: 1px solid #fff;
+}
+
+.student-modal-card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: min(96vw, 1040px);
+  max-height: 90vh;
+  overflow: auto;
+  padding: 18px;
+}
+
+.student-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.student-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
+  gap: 8px;
 }
 
 .delete-confirm-card {
@@ -746,5 +823,16 @@ body {
   .data-table {
     display: block;
     overflow-x: auto;
+  }
+
+  .suspicious-card,
+  .admin-row-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .student-modal-card {
+    width: min(96vw, 1040px);
+    padding: 14px;
   }
 }

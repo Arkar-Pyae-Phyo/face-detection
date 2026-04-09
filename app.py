@@ -18,6 +18,7 @@ import uuid
 import base64
 import random
 import datetime
+import glob
 from io import BytesIO
 from functools import wraps
 
@@ -76,6 +77,8 @@ EAR_OPEN_THRESHOLD  = 0.26   # EAR above this = eyes open
 
 # Head turn: how far nose must shift from center (as fraction of face width)
 HEAD_TURN_THRESHOLD = 0.12
+REGISTER_TURN_THRESHOLD = 0.07
+REGISTER_CENTER_THRESHOLD = 0.06
 
 # MediaPipe landmark indices
 # Left eye:  [362, 385, 387, 263, 373, 380]  (right side of image)
@@ -98,6 +101,140 @@ DB_CONFIG = {
     "database": "face_exam_db",
     "charset": "utf8mb4",
 }
+
+DEFAULT_EXAM_NAME = "General Exam"
+
+
+def ensure_admin_schema():
+    """
+    Best-effort schema upgrades for admin dashboard features.
+    Safe to run repeatedly.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS is_flagged TINYINT(1) NOT NULL DEFAULT 0
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE login_logs
+            ADD COLUMN IF NOT EXISTS liveness_status VARCHAR(20) NOT NULL DEFAULT 'unknown'
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE login_logs
+            ADD COLUMN IF NOT EXISTS match_score DECIMAL(5,2) DEFAULT NULL
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE login_logs
+            ADD COLUMN IF NOT EXISTS exam_name VARCHAR(100) NOT NULL DEFAULT 'General Exam'
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE login_logs
+            ADD COLUMN IF NOT EXISTS is_flagged TINYINT(1) NOT NULL DEFAULT 0
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[WARN] Could not apply admin schema upgrades: {e}")
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+
+def log_verification_attempt(cur, student_id, snapshot_path, verification_result,
+                             liveness_status="unknown", match_score=None,
+                             exam_name=DEFAULT_EXAM_NAME, is_flagged=False):
+    """Insert a login log record with rich metadata for admin review."""
+    cur.execute(
+        """
+        INSERT INTO login_logs
+            (student_id, snapshot_path, verification_result, liveness_status, match_score, exam_name, is_flagged)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            student_id,
+            snapshot_path,
+            verification_result,
+            liveness_status,
+            match_score,
+            exam_name or DEFAULT_EXAM_NAME,
+            1 if is_flagged else 0,
+        )
+    )
+
+
+def build_log_filters(logs, date_from="", date_to="", result="all",
+                      liveness="all", student_query="", exam_query=""):
+    """Apply log filters in Python to keep endpoint behavior deterministic."""
+    filtered = logs
+
+    if student_query:
+        q = student_query.strip().lower()
+        filtered = [l for l in filtered if q in (l.get("student_id", "").lower())]
+
+    if result and result != "all":
+        filtered = [l for l in filtered if l.get("verification_result") == result]
+
+    if liveness and liveness != "all":
+        filtered = [l for l in filtered if l.get("liveness_status") == liveness]
+
+    if exam_query:
+        e = exam_query.strip().lower()
+        filtered = [l for l in filtered if e in (l.get("exam_name") or "").lower()]
+
+    if date_from:
+        try:
+            from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
+            filtered = [
+                l for l in filtered
+                if isinstance(l.get("login_time"), datetime.datetime) and l["login_time"] >= from_dt
+            ]
+        except Exception:
+            pass
+
+    if date_to:
+        try:
+            to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1)
+            filtered = [
+                l for l in filtered
+                if isinstance(l.get("login_time"), datetime.datetime) and l["login_time"] < to_dt
+            ]
+        except Exception:
+            pass
+
+    return filtered
+
+
+def serialize_log_rows(logs):
+    """JSON-friendly conversion for log rows."""
+    for l in logs:
+        if isinstance(l.get("login_time"), datetime.datetime):
+            l["login_time"] = l["login_time"].strftime("%Y-%m-%d %H:%M:%S")
+        l["match_score"] = float(l["match_score"]) if l.get("match_score") is not None else None
+        l["liveness_status"] = l.get("liveness_status") or "unknown"
+        l["exam_name"] = l.get("exam_name") or DEFAULT_EXAM_NAME
+        l["is_flagged"] = bool(l.get("is_flagged"))
+    return logs
 
 
 def get_db():
@@ -369,6 +506,56 @@ def analyze_liveness_frames(frames_b64, challenge):
     return False, "Unknown challenge."
 
 
+def check_registration_pose(img_array: np.ndarray, expected_pose: str, reference_sign: str = "") -> tuple:
+    """
+    Validate whether the current frame matches the expected registration pose.
+
+    expected_pose:
+      - "center": user faces forward
+      - "left":   user turns head to LEFT
+      - "right":  user turns head to RIGHT
+
+    Returns (ok: bool, message: str, turn_sign: str)
+    """
+    ok, reason = image_quality_ok(img_array)
+    if not ok:
+        return False, reason, ""
+
+    ok, reason = assess_face_posture(img_array)
+    if not ok:
+        return False, reason, ""
+
+    img_h, img_w = img_array.shape[:2]
+    results = mp_face_mesh.process(img_array)
+    if not results.multi_face_landmarks:
+        return False, "Face landmarks not clear. Keep your face inside the guide.", ""
+
+    lm = results.multi_face_landmarks[0].landmark
+    turn = compute_head_turn_ratio(lm, img_w)
+    turn_sign = "positive" if turn >= 0 else "negative"
+
+    if expected_pose == "center":
+        if abs(turn) <= REGISTER_CENTER_THRESHOLD:
+            return True, "Front pose detected.", turn_sign
+        return False, "Look straight at the camera.", turn_sign
+
+    if expected_pose == "left":
+        if abs(turn) >= REGISTER_TURN_THRESHOLD:
+            return True, "Side turn detected for LEFT step.", turn_sign
+        return False, "Turn your head to one side (LEFT step).", turn_sign
+
+    if expected_pose == "right":
+        if abs(turn) < REGISTER_TURN_THRESHOLD:
+            return False, "Turn your head to the opposite side for RIGHT step.", turn_sign
+
+        if reference_sign in {"positive", "negative"} and turn_sign == reference_sign:
+            return False, "This is the same side as before. Turn to the opposite side.", turn_sign
+
+        return True, "Opposite side turn detected for RIGHT step.", turn_sign
+
+    return False, "Invalid pose type requested.", ""
+
+
 # =============================================================
 # Page routes
 # =============================================================
@@ -518,6 +705,34 @@ def api_posture_check():
         return jsonify(success=False, message=reason)
 
     return jsonify(success=True, message="Posture is acceptable.")
+
+
+@app.route("/api/register-pose-check", methods=["POST"])
+def api_register_pose_check():
+    """Validate if the frame matches the expected pose for registration capture."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify(success=False, message="No data received."), 400
+
+    image_b64 = data.get("image", "")
+    expected_pose = (data.get("expected_pose") or "").strip().lower()
+    reference_sign = (data.get("reference_sign") or "").strip().lower()
+
+    if not image_b64:
+        return jsonify(success=False, message="No image received."), 400
+    if expected_pose not in {"center", "left", "right"}:
+        return jsonify(success=False, message="Expected pose must be center, left, or right."), 400
+
+    try:
+        img_array = decode_base64_image(image_b64)
+    except Exception:
+        return jsonify(success=False, message="Invalid image data."), 400
+
+    ok, message, turn_sign = check_registration_pose(img_array, expected_pose, reference_sign)
+    if not ok:
+        return jsonify(success=False, message=message, turn_sign=turn_sign)
+
+    return jsonify(success=True, message=message, turn_sign=turn_sign)
 
 
 # =============================================================
@@ -745,6 +960,7 @@ def api_verify_face():
 
     student_id = (data.get("student_id") or "").strip()
     image_b64  = data.get("image", "")
+    exam_name = (data.get("exam") or DEFAULT_EXAM_NAME).strip() or DEFAULT_EXAM_NAME
 
     # Reject if either field is empty
     if not student_id:
@@ -752,21 +968,12 @@ def api_verify_face():
     if not image_b64:
         return jsonify(success=False, message="No image received."), 400
 
-    # ---- Step 1b: Ensure liveness check was passed ----
-    # The frontend must call /api/liveness-check before /api/verify-face.
-    # This prevents someone from bypassing liveness by calling the API directly.
-    if not session.get("liveness_passed"):
-        return jsonify(
-            success=False,
-            message="Liveness check required. Please complete the liveness challenge first."
-        ), 403
-
     # ---- Step 2: Look up the student in the database ----
     # We need the stored face encoding to compare against.
     conn = get_db()
     cur = conn.cursor(dictionary=True)
     cur.execute(
-        "SELECT student_id, student_name, face_encoding FROM students WHERE student_id = %s",
+        "SELECT student_id, student_name, face_encoding, is_flagged, failed_attempts FROM students WHERE student_id = %s",
         (student_id,)
     )
     student = cur.fetchone()
@@ -799,13 +1006,25 @@ def api_verify_face():
     # face_recognition.face_locations() returns a list of bounding boxes.
     # We require exactly ONE face — no face or multiple faces = rejection.
     face_locations = face_recognition.face_locations(img_array, model="hog")
+    liveness_passed = bool(session.get("liveness_passed", False))
+    liveness_status = "passed" if liveness_passed else "failed"
 
     if len(face_locations) == 0:
         # No face found → log as failed attempt with snapshot
         snap = save_numpy_image(img_array, VERIFICATION_FOLDER, f"verify_{student_id}")
+        log_verification_attempt(
+            cur,
+            student_id,
+            snap,
+            "failed",
+            liveness_status=liveness_status,
+            match_score=None,
+            exam_name=exam_name,
+            is_flagged=True,
+        )
         cur.execute(
-            "INSERT INTO login_logs (student_id, snapshot_path, verification_result) VALUES (%s,%s,%s)",
-            (student_id, snap, "failed")
+            "UPDATE students SET failed_attempts = failed_attempts + 1, is_flagged = 1 WHERE student_id = %s",
+            (student_id,)
         )
         conn.commit(); cur.close(); conn.close()
         return jsonify(success=False, message="No face detected. Please face the camera directly."), 400
@@ -813,9 +1032,19 @@ def api_verify_face():
     if len(face_locations) > 1:
         # Multiple faces → could be impersonation attempt → reject
         snap = save_numpy_image(img_array, VERIFICATION_FOLDER, f"verify_{student_id}")
+        log_verification_attempt(
+            cur,
+            student_id,
+            snap,
+            "failed",
+            liveness_status=liveness_status,
+            match_score=None,
+            exam_name=exam_name,
+            is_flagged=True,
+        )
         cur.execute(
-            "INSERT INTO login_logs (student_id, snapshot_path, verification_result) VALUES (%s,%s,%s)",
-            (student_id, snap, "failed")
+            "UPDATE students SET failed_attempts = failed_attempts + 1, is_flagged = 1 WHERE student_id = %s",
+            (student_id,)
         )
         conn.commit(); cur.close(); conn.close()
         return jsonify(
@@ -850,10 +1079,29 @@ def api_verify_face():
     # This creates an audit trail visible in the admin panel.
     # Fields: student_id, snapshot_path, verification_result, login_time (auto)
     result_str = "success" if match else "failed"
-    cur.execute(
-        "INSERT INTO login_logs (student_id, snapshot_path, verification_result) VALUES (%s,%s,%s)",
-        (student_id, snap, result_str)
+    flagged_attempt = (not liveness_passed) or (not match)
+    log_verification_attempt(
+        cur,
+        student_id,
+        snap,
+        result_str,
+        liveness_status=liveness_status,
+        match_score=confidence,
+        exam_name=exam_name,
+        is_flagged=flagged_attempt,
     )
+
+    if match:
+        cur.execute(
+            "UPDATE students SET failed_attempts = 0 WHERE student_id = %s",
+            (student_id,)
+        )
+    else:
+        cur.execute(
+            "UPDATE students SET failed_attempts = failed_attempts + 1, is_flagged = 1 WHERE student_id = %s",
+            (student_id,)
+        )
+
     conn.commit()
 
     # ---- Step 10: Return the result ----
@@ -907,7 +1155,8 @@ def api_students():
 
     # ---- Fetch all registered students (newest first) ----
     cur.execute("""
-        SELECT student_id, student_name, email, photo_path, created_at
+        SELECT student_id, student_name, email, photo_path, face_encoding,
+               created_at, is_flagged, failed_attempts
         FROM students
         ORDER BY created_at DESC
     """)
@@ -918,23 +1167,50 @@ def api_students():
     for s in students:
         if isinstance(s.get("created_at"), datetime.datetime):
             s["created_at"] = s["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+        face_encoding = s.get("face_encoding")
+        s["encoding_status"] = "available" if face_encoding else "missing"
+        s["encoding_dimensions"] = 0
+        if face_encoding:
+            try:
+                s["encoding_dimensions"] = len(json.loads(face_encoding))
+            except Exception:
+                s["encoding_dimensions"] = 0
+        s["is_flagged"] = bool(s.get("is_flagged"))
+        s["failed_attempts"] = int(s.get("failed_attempts") or 0)
+        s.pop("face_encoding", None)
 
     # ---- Fetch all login logs (newest first) ----
     cur.execute("""
-        SELECT id, student_id, snapshot_path, verification_result, login_time
+        SELECT id, student_id, snapshot_path, verification_result,
+               liveness_status, match_score, exam_name, is_flagged, login_time
         FROM login_logs
         ORDER BY login_time DESC
     """)
     logs = cur.fetchall()
 
-    # Convert datetime objects in logs too
-    for l in logs:
-        if isinstance(l.get("login_time"), datetime.datetime):
-            l["login_time"] = l["login_time"].strftime("%Y-%m-%d %H:%M:%S")
+    # Optional log filters via query params
+    date_from = (request.args.get("date_from") or "").strip()
+    date_to = (request.args.get("date_to") or "").strip()
+    result = (request.args.get("result") or "all").strip().lower()
+    liveness = (request.args.get("liveness") or "all").strip().lower()
+    student_query = (request.args.get("student") or "").strip()
+    exam_query = (request.args.get("exam") or "").strip()
+
+    logs = build_log_filters(logs, date_from, date_to, result, liveness, student_query, exam_query)
+    logs = serialize_log_rows(logs)
+
+    suspicious_count = sum(1 for l in logs if l.get("is_flagged"))
+    recent_activity = logs[:15]
 
     cur.close(); conn.close()
 
-    return jsonify(success=True, students=students, logs=logs)
+    return jsonify(
+        success=True,
+        students=students,
+        logs=logs,
+        recent_activity=recent_activity,
+        suspicious_count=suspicious_count,
+    )
 
 
 # =============================================================
@@ -961,20 +1237,241 @@ def api_login_logs():
     cur = conn.cursor(dictionary=True)
 
     cur.execute("""
-        SELECT id, student_id, snapshot_path, verification_result, login_time
+        SELECT id, student_id, snapshot_path, verification_result,
+               liveness_status, match_score, exam_name, is_flagged, login_time
         FROM login_logs
         ORDER BY login_time DESC
     """)
     logs = cur.fetchall()
 
-    # Convert datetime to string for JSON
-    for l in logs:
-        if isinstance(l.get("login_time"), datetime.datetime):
-            l["login_time"] = l["login_time"].strftime("%Y-%m-%d %H:%M:%S")
+    date_from = (request.args.get("date_from") or "").strip()
+    date_to = (request.args.get("date_to") or "").strip()
+    result = (request.args.get("result") or "all").strip().lower()
+    liveness = (request.args.get("liveness") or "all").strip().lower()
+    student_query = (request.args.get("student") or "").strip()
+    exam_query = (request.args.get("exam") or "").strip()
+
+    logs = build_log_filters(logs, date_from, date_to, result, liveness, student_query, exam_query)
+    logs = serialize_log_rows(logs)
 
     cur.close(); conn.close()
 
     return jsonify(success=True, logs=logs)
+
+
+@app.route("/api/suspicious-attempts", methods=["GET"])
+def api_suspicious_attempts():
+    """Return flagged verification attempts for quick admin review."""
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        """
+        SELECT id, student_id, snapshot_path, verification_result,
+               liveness_status, match_score, exam_name, is_flagged, login_time
+        FROM login_logs
+        WHERE is_flagged = 1
+        ORDER BY login_time DESC
+        LIMIT 100
+        """
+    )
+    logs = serialize_log_rows(cur.fetchall())
+    cur.close(); conn.close()
+    return jsonify(success=True, count=len(logs), logs=logs)
+
+
+@app.route("/api/student/<student_id>", methods=["GET"])
+def api_student_detail(student_id):
+    """Return full student profile with recent login history and face metadata."""
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute(
+        """
+        SELECT student_id, student_name, email, photo_path, face_encoding,
+               created_at, is_flagged, failed_attempts
+        FROM students
+        WHERE student_id = %s
+        """,
+        (student_id,)
+    )
+    student = cur.fetchone()
+    if not student:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Student not found."), 404
+
+    encoding_vec = []
+    if student.get("face_encoding"):
+        try:
+            encoding_vec = json.loads(student["face_encoding"])
+        except Exception:
+            encoding_vec = []
+
+    reg_glob = os.path.join(REGISTRATION_FOLDER, f"{student_id}_*.jpg")
+    reg_images = [
+        os.path.relpath(p, os.path.dirname(__file__)).replace("\\", "/")
+        for p in glob.glob(reg_glob)
+    ]
+    reg_images.sort(reverse=True)
+
+    cur.execute(
+        """
+        SELECT id, student_id, snapshot_path, verification_result,
+               liveness_status, match_score, exam_name, is_flagged, login_time
+        FROM login_logs
+        WHERE student_id = %s
+        ORDER BY login_time DESC
+        LIMIT 20
+        """,
+        (student_id,)
+    )
+    recent_logs = serialize_log_rows(cur.fetchall())
+
+    if isinstance(student.get("created_at"), datetime.datetime):
+        student["created_at"] = student["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+
+    payload = {
+        "student_id": student["student_id"],
+        "student_name": student["student_name"],
+        "email": student.get("email"),
+        "photo_path": student.get("photo_path"),
+        "created_at": student.get("created_at"),
+        "is_flagged": bool(student.get("is_flagged")),
+        "failed_attempts": int(student.get("failed_attempts") or 0),
+        "encoding_status": "available" if encoding_vec else "missing",
+        "encoding_dimensions": len(encoding_vec),
+        "encoding_mean": round(float(np.mean(encoding_vec)), 6) if encoding_vec else None,
+        "registered_images": reg_images,
+    }
+
+    cur.close(); conn.close()
+    return jsonify(success=True, profile=payload, logs=recent_logs)
+
+
+@app.route("/api/student/<student_id>", methods=["PUT"])
+def api_student_update(student_id):
+    """Update student profile fields from admin dashboard."""
+    data = request.get_json(silent=True) or {}
+    student_name = (data.get("student_name") or "").strip()
+    email = (data.get("email") or "").strip()
+
+    if not student_name:
+        return jsonify(success=False, message="Student name is required."), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE students
+        SET student_name = %s, email = %s
+        WHERE student_id = %s
+        """,
+        (student_name, email or None, student_id)
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Student not found."), 404
+    cur.close(); conn.close()
+    return jsonify(success=True, message="Student profile updated.")
+
+
+@app.route("/api/student/<student_id>/re-enroll-face", methods=["POST"])
+def api_student_reenroll_face(student_id):
+    """Clear stored face encoding so admin can re-enroll student face."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE students
+        SET face_encoding = NULL, photo_path = NULL, failed_attempts = 0
+        WHERE student_id = %s
+        """,
+        (student_id,)
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Student not found."), 404
+    cur.close(); conn.close()
+    return jsonify(success=True, message="Face data cleared. Student can be re-enrolled.")
+
+
+@app.route("/api/student/<student_id>/face-data", methods=["DELETE"])
+def api_student_delete_face_data(student_id):
+    """Delete stored face data while keeping the student profile."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE students
+        SET face_encoding = NULL, photo_path = NULL
+        WHERE student_id = %s
+        """,
+        (student_id,)
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Student not found."), 404
+    cur.close(); conn.close()
+    return jsonify(success=True, message="Stored face data removed.")
+
+
+@app.route("/api/student/<student_id>/reset-attempts", methods=["POST"])
+def api_student_reset_attempts(student_id):
+    """Reset failed attempt counter for a student."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE students SET failed_attempts = 0 WHERE student_id = %s",
+        (student_id,)
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Student not found."), 404
+    cur.close(); conn.close()
+    return jsonify(success=True, message="Failed attempts reset.")
+
+
+@app.route("/api/student/<student_id>/flag", methods=["POST"])
+def api_student_flag(student_id):
+    """Flag or unflag a student account for admin monitoring."""
+    data = request.get_json(silent=True) or {}
+    flagged = bool(data.get("flagged", True))
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE students SET is_flagged = %s WHERE student_id = %s",
+        (1 if flagged else 0, student_id)
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Student not found."), 404
+    cur.close(); conn.close()
+    return jsonify(success=True, message="Student flag status updated.", flagged=flagged)
+
+
+@app.route("/api/login-log/<int:log_id>/flag", methods=["POST"])
+def api_login_log_flag(log_id):
+    """Flag or unflag a login attempt row."""
+    data = request.get_json(silent=True) or {}
+    flagged = bool(data.get("flagged", True))
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE login_logs SET is_flagged = %s WHERE id = %s",
+        (1 if flagged else 0, log_id)
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        return jsonify(success=False, message="Login log not found."), 404
+    cur.close(); conn.close()
+    return jsonify(success=True, message="Login log flag updated.", flagged=flagged)
 
 
 # =============================================================
@@ -1035,6 +1532,7 @@ def serve_upload(filename):
 # =============================================================
 
 if __name__ == "__main__":
+    ensure_admin_schema()
     print("=" * 55)
     print("  Exam Face Verification System")
     print("  http://127.0.0.1:5000")

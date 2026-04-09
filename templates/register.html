@@ -47,6 +47,7 @@
 
     <!-- Capture progress dots (1 dot per sample) -->
     <div class="capture-progress" id="captureProgress"></div>
+    <div class="status-bar show info mt-2" id="poseHintBar" style="display:none;"></div>
   </div>
 
   <!-- ========== Status / Feedback Messages ========== -->
@@ -77,23 +78,21 @@
 
 {% block scripts %}
 <script>
-  // ==================================================================
-  //  Registration Page – JavaScript Logic
-  // ==================================================================
+  const CAPTURE_SEQUENCE = [
+    { pose: 'center', label: 'Look straight at the camera' },
+    { pose: 'left',   label: 'Turn your head LEFT' },
+    { pose: 'right',  label: 'Turn your head RIGHT' },
+  ];
 
-  // --------------- Configuration ---------------
-  const TOTAL_CAPTURES = 5;       // Number of face images to capture
-  const CAPTURE_DELAY_MS = 700;   // Delay between automatic captures (ms)
+  const TOTAL_CAPTURES = CAPTURE_SEQUENCE.length;
+  const STEP_TIMEOUT_MS = 12000;
+  const STEP_POLL_MS = 450;
 
-  // --------------- State variables ---------------
-  let capturedImages = [];         // Array of base64-encoded JPEG strings
-  let cameraStream   = null;       // MediaStream reference for cleanup
+  let capturedImages = [];
+  let cameraStream = null;
+  let leftStepSign = '';
 
-  // ==================================================================
-  //  Step 1: Validate form fields and start the webcam
-  // ==================================================================
   async function startCamera() {
-    // --- Validate required fields before opening camera ---
     const sid  = document.getElementById('studentId').value.trim();
     const name = document.getElementById('studentName').value.trim();
 
@@ -104,40 +103,34 @@
       return showStatus('Please enter your full name.', 'error');
     }
 
-    // --- Request camera access via getUserMedia ---
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: 'user' }
       });
 
-      // Attach stream to the <video> element
       document.getElementById('videoPreview').srcObject = cameraStream;
-
-      // Show the camera section
       document.getElementById('cameraSection').style.display = 'block';
 
-      // Build progress-dot indicators (1 per capture)
       const dotsHtml = Array.from({ length: TOTAL_CAPTURES }, (_, i) =>
         `<div class="capture-dot" id="dot-${i}"></div>`
       ).join('');
       document.getElementById('captureProgress').innerHTML = dotsHtml;
 
-      // Swap buttons: hide "Start Camera", show "Capture Face Samples"
       document.getElementById('btnStartCamera').style.display = 'none';
       document.getElementById('btnCaptureSamples').style.display = 'flex';
 
-      // Lock the form fields so they can't be changed mid-capture
       document.getElementById('studentId').readOnly = true;
       document.getElementById('studentName').readOnly = true;
       document.getElementById('studentEmail').readOnly = true;
 
+      setPoseHint('Follow the posture instruction shown here for each capture.', 'info');
+
       showStatus(
-        'Camera ready! Position your face inside the oval guide, then click "Capture Face Samples".',
+        'Camera ready. You will be guided through 3 poses: straight, left, right.',
         'info'
       );
 
     } catch (err) {
-      // Handle permission denied or missing camera
       console.error('Camera error:', err);
       showStatus(
         'Could not access the camera. Please allow camera permissions and try again.',
@@ -146,109 +139,110 @@
     }
   }
 
-  // ==================================================================
-  //  Step 2: Automatically capture 5 face images with short delays
-  // ==================================================================
   async function captureFaceSamples() {
     const btn = document.getElementById('btnCaptureSamples');
-    btn.disabled = true;   // prevent double-clicks
-    capturedImages = [];   // reset any previous captures
+    btn.disabled = true;
+    capturedImages = [];
+    leftStepSign = '';
 
-    showStatus('Checking posture. Look straight at the camera.', 'info');
-    const postureReady = await waitForCorrectPosture();
-    if (!postureReady) {
-      btn.disabled = false;
-      return;
-    }
-
-    // Reset all progress dots to uncaptured state
     for (let i = 0; i < TOTAL_CAPTURES; i++) {
       document.getElementById(`dot-${i}`).classList.remove('captured');
     }
 
-    // Activate the scan-line animation overlay
     document.getElementById('scanLine').classList.add('active');
 
-    showStatus('Scanning... Please look at the camera and stay still.', 'info');
-
-    // --- Capture loop: take one frame per iteration ---
-    for (let i = 0; i < TOTAL_CAPTURES; i++) {
-      // Short delay between captures so the user can shift gaze slightly
-      await sleep(CAPTURE_DELAY_MS);
-
-      // Grab the current frame as a base64 JPEG data URL
-      const frameData = captureCurrentFrame();
-
-      if (frameData) {
-        capturedImages.push(frameData);
-        // Light up the corresponding progress dot
-        document.getElementById(`dot-${i}`).classList.add('captured');
+    for (let i = 0; i < CAPTURE_SEQUENCE.length; i++) {
+      const step = CAPTURE_SEQUENCE[i];
+      const ok = await captureSingleStep(i, step);
+      if (!ok) {
+        document.getElementById('scanLine').classList.remove('active');
+        btn.disabled = false;
+        showStatus('Capture timed out. Please restart and follow the posture instructions.', 'warning');
+        return;
       }
-
-      showStatus(`Captured ${i + 1} of ${TOTAL_CAPTURES}...`, 'info');
     }
 
-    // Stop the scan animation
     document.getElementById('scanLine').classList.remove('active');
 
-    // --- Evaluate capture results ---
-    if (capturedImages.length >= 3) {
-      // Enough good images → allow submission
+    if (capturedImages.length === TOTAL_CAPTURES) {
       showStatus(
-        `${capturedImages.length} face samples captured successfully. Click "Complete Registration" to submit.`,
+        `${capturedImages.length} posture-guided face samples captured. Click "Complete Registration".`,
         'success'
       );
+      setPoseHint('All posture steps completed successfully.', 'success');
       document.getElementById('btnCaptureSamples').style.display = 'none';
       document.getElementById('btnSubmit').style.display = 'flex';
     } else {
-      // Not enough frames – let user retry
-      showStatus(
-        'Not enough clear frames captured. Please improve lighting and try again.',
-        'error'
-      );
+      showStatus('Could not capture all required poses. Please try again.', 'error');
       btn.disabled = false;
     }
   }
 
-  // ==================================================================
-  //  captureCurrentFrame()
-  //  Draws the current video frame onto a hidden <canvas>
-  //  and returns it as a base64-encoded JPEG data URL.
-  // ==================================================================
+  async function captureSingleStep(index, step) {
+    const stepText = `Step ${index + 1}/${TOTAL_CAPTURES}: ${step.label}`;
+    setPoseHint(stepText, 'info');
+    showStatus(`${stepText}. Keep your face inside the oval.`, 'info');
+
+    const referenceSign = step.pose === 'right' ? leftStepSign : '';
+    const poseReady = await waitForExpectedPose(step.pose, STEP_TIMEOUT_MS, referenceSign);
+    if (!poseReady) {
+      showStatus(`Warning: wrong posture for step ${index + 1}. ${step.label}.`, 'warning');
+      setPoseHint(`Warning: ${step.label}`, 'warning');
+      return false;
+    }
+
+    await sleep(250);
+    const frameData = captureCurrentFrame();
+    if (!frameData) {
+      showStatus('Capture failed. Please keep your camera active and retry.', 'error');
+      return false;
+    }
+
+    const validation = await registrationPoseCheck(frameData, step.pose, referenceSign);
+    if (!validation.success) {
+      showStatus(`Warning: ${validation.message}`, 'warning');
+      setPoseHint(`Warning: ${step.label}`, 'warning');
+      return false;
+    }
+
+    if (step.pose === 'left' && validation.turn_sign) {
+      leftStepSign = validation.turn_sign;
+    }
+
+    capturedImages.push(frameData);
+    document.getElementById(`dot-${index}`).classList.add('captured');
+    showStatus(`Captured step ${index + 1}: ${step.label}.`, 'success');
+    return true;
+  }
+
   function captureCurrentFrame() {
     const video  = document.getElementById('videoPreview');
     const canvas = document.getElementById('captureCanvas');
 
-    // Match canvas dimensions to the live video resolution
     canvas.width  = video.videoWidth;
     canvas.height = video.videoHeight;
+    if (!canvas.width || !canvas.height) {
+      return null;
+    }
 
-    // Draw the video frame onto the canvas
     const ctx = canvas.getContext('2d');
     ctx.drawImage(video, 0, 0);
-
-    // Export as JPEG with 90% quality → returns "data:image/jpeg;base64,..."
     return canvas.toDataURL('image/jpeg', 0.9);
   }
 
-  // ==================================================================
-  //  Step 3: Send captured images + student info to the backend
-  // ==================================================================
   async function submitRegistration() {
     const btn = document.getElementById('btnSubmit');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Processing faces...';
 
-    // Build the JSON payload
     const payload = {
       student_id:   document.getElementById('studentId').value.trim(),
       student_name: document.getElementById('studentName').value.trim(),
       email:        document.getElementById('studentEmail').value.trim(),
-      images:       capturedImages,   // array of base64 data URLs
+      images:       capturedImages,
     };
 
     try {
-      // POST to the Flask /api/register-face endpoint
       const response = await fetch('/api/register-face', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -258,27 +252,20 @@
       const result = await response.json();
 
       if (result.success) {
-        // --- Registration succeeded ---
         showStatus(result.message, 'success');
         btn.style.display = 'none';
-
-        // Stop the webcam stream to release the camera
         stopCamera();
-
-        // Redirect to login page after a brief pause
         setTimeout(() => {
           window.location.href = '/login';
         }, 2500);
 
       } else {
-        // --- Backend returned an error (e.g. no face, duplicate ID) ---
         showStatus(result.message, 'error');
         btn.disabled = false;
         btn.innerHTML = 'Complete Registration';
       }
 
     } catch (networkErr) {
-      // --- Network / fetch failure ---
       console.error('Submit error:', networkErr);
       showStatus('Network error. Please check your connection and try again.', 'error');
       btn.disabled = false;
@@ -286,64 +273,74 @@
     }
   }
 
-  // ==================================================================
-  //  stopCamera()
-  //  Stops all media tracks to release the webcam hardware.
-  // ==================================================================
   function stopCamera() {
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
       cameraStream = null;
     }
+    const hint = document.getElementById('poseHintBar');
+    hint.style.display = 'none';
   }
 
-  async function postureCheck(imageBase64) {
+  async function registrationPoseCheck(imageBase64, expectedPose, referenceSign = '') {
     try {
-      const response = await fetch('/api/posture-check', {
+      const response = await fetch('/api/register-pose-check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: imageBase64 }),
+        body: JSON.stringify({
+          image: imageBase64,
+          expected_pose: expectedPose,
+          reference_sign: referenceSign,
+        }),
       });
       return await response.json();
     } catch (err) {
-      return { success: false, message: 'Unable to check posture. Please keep your face steady.' };
+      return { success: false, message: 'Unable to check posture. Keep your face steady and retry.' };
     }
   }
 
-  async function waitForCorrectPosture() {
+  async function waitForExpectedPose(expectedPose, timeoutMs, referenceSign = '') {
+    const start = Date.now();
     let stableFrames = 0;
 
     while (cameraStream) {
+      if (Date.now() - start > timeoutMs) {
+        return false;
+      }
+
       const frame = captureCurrentFrame();
       if (!frame) {
         await sleep(250);
         continue;
       }
 
-      const result = await postureCheck(frame);
+      const result = await registrationPoseCheck(frame, expectedPose, referenceSign);
       if (result.success) {
         stableFrames += 1;
+        if (expectedPose === 'left' && result.turn_sign) {
+          leftStepSign = result.turn_sign;
+        }
         if (stableFrames >= 2) {
-          showStatus('Posture accepted.', 'success');
+          showStatus('Posture accepted. Hold still for capture...', 'success');
           return true;
         }
       } else {
         stableFrames = 0;
-        showStatus(result.message || 'Adjust your face position and try again.', 'warning');
+        showStatus(`Warning: ${result.message || 'Adjust your posture.'}`, 'warning');
       }
 
-      await sleep(500);
+      await sleep(STEP_POLL_MS);
     }
 
     showStatus('Camera is not active. Please start the camera again.', 'error');
     return false;
   }
 
-  // ==================================================================
-  //  sleep(ms)  –  Promise-based delay for async/await usage.
-  // ==================================================================
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  function setPoseHint(message, type = 'info') {
+    const hint = document.getElementById('poseHintBar');
+    hint.style.display = 'block';
+    hint.className = `status-bar show ${type} mt-2`;
+    hint.textContent = `Posture guide: ${message}`;
   }
 </script>
 {% endblock %}

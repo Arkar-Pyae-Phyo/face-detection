@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS students (
     email        VARCHAR(100)  DEFAULT NULL,
     photo_path   TEXT          DEFAULT NULL,
     face_encoding LONGTEXT     DEFAULT NULL,   -- JSON-serialized averaged encoding
+  is_flagged   TINYINT(1)    NOT NULL DEFAULT 0,
+  failed_attempts INT        NOT NULL DEFAULT 0,
     created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -31,8 +33,18 @@ CREATE TABLE IF NOT EXISTS login_logs (
     student_id          VARCHAR(20)   NOT NULL,
     snapshot_path       TEXT          DEFAULT NULL,
     verification_result VARCHAR(20)   NOT NULL,   -- 'success' or 'failed'
+  liveness_status     VARCHAR(20)   NOT NULL DEFAULT 'unknown',
+  match_score         DECIMAL(5,2)  DEFAULT NULL,
+  exam_name           VARCHAR(100)  NOT NULL DEFAULT 'General Exam',
+  is_flagged          TINYINT(1)    NOT NULL DEFAULT 0,
     login_time          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (student_id) REFERENCES students(student_id)
         ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+  CREATE INDEX idx_login_logs_time ON login_logs(login_time);
+  CREATE INDEX idx_login_logs_result ON login_logs(verification_result);
+  CREATE INDEX idx_login_logs_liveness ON login_logs(liveness_status);
+  CREATE INDEX idx_login_logs_exam ON login_logs(exam_name);
+  CREATE INDEX idx_login_logs_flagged ON login_logs(is_flagged);
