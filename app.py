@@ -970,8 +970,15 @@ def api_verify_face():
 
     # ---- Step 2: Look up the student in the database ----
     # We need the stored face encoding to compare against.
-    conn = get_db()
-    cur = conn.cursor(dictionary=True)
+    try:
+        conn = get_db()
+        cur = conn.cursor(dictionary=True)
+    except Exception as e:
+        print(f"[ERROR] Database unavailable during verification: {e}")
+        return jsonify(
+            success=False,
+            message="Database is unavailable. Please start MySQL and try again.",
+        ), 503
     cur.execute(
         "SELECT student_id, student_name, face_encoding, is_flagged, failed_attempts FROM students WHERE student_id = %s",
         (student_id,)

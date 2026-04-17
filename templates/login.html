@@ -136,7 +136,19 @@
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(payload),
       });
-      const result = await response.json();
+      let result = null;
+      const contentType = response.headers.get('content-type') || '';
+
+      if (contentType.includes('application/json')) {
+        result = await response.json();
+      } else {
+        const rawText = await response.text();
+        console.error('Unexpected non-JSON verify response:', response.status, rawText);
+        result = {
+          success: false,
+          message: 'Server returned an unexpected response. Please try again.',
+        };
+      }
 
       document.getElementById('loginScanLine').classList.remove('active');
 
@@ -152,7 +164,10 @@
         stopLoginCamera();
         setTimeout(() => { window.location.href = '/exam'; }, 1800);
       } else {
-        showStatus(result.message, 'error');
+        const fallbackMessage = response.status === 503
+          ? 'Database is offline. Start MySQL, then try again.'
+          : 'Verification failed. Please try again.';
+        showStatus(result.message || fallbackMessage, 'error');
         btn.disabled = false;
         btn.innerHTML = 'Verify Face';
       }
